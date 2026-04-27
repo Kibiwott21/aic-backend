@@ -7,7 +7,7 @@ import {
   sendLoginOTP, sendPasswordReset
 } from '../services/emailService.js';
 
-const FRONTEND = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/frontend\/pages\/?$/, '').replace(/:5500/, ':3000').replace(/:5173/, ':3000');
+const FRONTEND = (process.env.FRONTEND_URL || '${process.env.next_public_api_url}').replace(/\/frontend\/pages\/?$/, '').replace(/:5500/, ':3000').replace(/:5173/, ':3000');
 
 // ════════════════════════════════════════════════════════════
 // BRUTE FORCE PROTECTION — In-memory + Database

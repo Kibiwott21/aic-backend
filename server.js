@@ -30,6 +30,12 @@ app.use((req, res, next) => {
 // WiFi access control
 app.use(wifiAccessControl);
 
+// Health/status route (always open)
+app.get("/api/health", getNetworkStatus);
+
+// Protected routes
+app.post("/api/auth/staff/login", staffLoginHandler);
+
 // API routes
 app.use('/api', routes);
 app.get('/api/network-status', getNetworkStatus);

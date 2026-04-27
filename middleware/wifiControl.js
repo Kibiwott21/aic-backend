@@ -232,6 +232,13 @@ export const wifiAccessControl = async (req, res, next) => {
   });
 };
 
+// Utility: check if client IP belongs to allowed networks
+function isAllowed(ip) {
+  const allowedSubnets = ["192.168.1.0/24"]; // adjust as needed
+  // implement subnet check logic here
+  return true; // placeholder
+}
+
 // ── NETWORK STATUS ENDPOINT ───────────────────────────────────
 export const getNetworkStatus = (req, res) => {
   const ip = getClientIP(req);
@@ -246,6 +253,24 @@ export const getNetworkStatus = (req, res) => {
     ],
     timestamp: new Date().toISOString()
   });
+};
+
+// ── WIFI ACCESS CONTROL MIDDLEWARE ───────────────────────
+export const wifiAccessControl = (req, res, next) => {
+  if (process.env.NODE_ENV === "production") {
+    const ip = getClientIP(req);
+    const clean = ip.startsWith("::ffff:") ? ip.slice(7) : ip;
+
+    if (!isAllowed(clean)) {
+      return res.status(403).json({
+        error: "Access denied — only hospital WiFi allowed",
+        code: "NOT_ON_HOSPITAL_WIFI",
+        allowedNetworks: ["AIC-Staff-Secure","AIC-Clinical","AIC-Patients"]
+      });
+    }
+  }
+  // In development, skip restriction
+  next();
 };
 
 // ── ATTACK REPORT (for admin dashboard) ──────────────────────
