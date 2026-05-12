@@ -1,0 +1,265 @@
+// middleware/wifiControl.js
+
+import { query } from '../config/database.js';
+import { sendIntrusionAlert } from '../services/emailService.js';
+
+// ── ALLOWED NETWORKS ──────────────────────────────────────────────
+const ALLOWED_CIDRS = [
+  '192.168.1.0/24',   // Hospital WiFi SSIDs
+  '127.0.0.1/32',     // Localhost
+  '::1/128',          // IPv6 localhost
+  '::ffff:127.0.0.1', // IPv4-mapped IPv6 localhost
+  '0.0.0.0/8',        // Development local network
+  '10.0.0.0/8'        // Private network
+];
+
+// ── ATTACK TRACKING ──────────────────────────────────────────────
+const attackTracker = new Map(); // { ip: { count, firstSeen, lastSeen, paths, userAgents } }
+
+// ── IP UTILITIES ─────────────────────────────────────────────────
+function ipToInt(ip) {
+  return ip.split('.').reduce((a, o) => (a << 8) + parseInt(o, 10), 0) >>> 0;
+}
+
+function isInCIDR(ip, cidr) {
+  try {
+    // handle IPv6 localhost special cases quickly
+    if (ip === '::1' && cidr === '::1/128') return true;
+    if (ip.includes(':') && !ip.startsWith('::ffff:')) return cidr.includes(':');
+    if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+
+    const [net, prefix] = cidr.split('/');
+    if (!net || !prefix) return false;
+    if (net.includes(':')) return false; // we don't handle IPv6 CIDR matching here
+
+    const mask = parseInt(prefix, 10) === 32 ? 0xFFFFFFFF : ~(0xFFFFFFFF >>> parseInt(prefix, 10));
+    return (ipToInt(ip) & mask) === (ipToInt(net) & mask);
+  } catch {
+    return false;
+  }
+}
+
+function getClientIP(req) {
+  const raw =
+    req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+    req.headers['x-real-ip'] ||
+    req.socket?.remoteAddress ||
+    'unknown';
+  return raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+}
+
+function isAllowed(ip) {
+  if (!ip || ip === 'unknown') return false;
+  const clean = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  return ALLOWED_CIDRS.some(c => isInCIDR(clean, c));
+}
+
+// ── ATTACKER PROFILE ─────────────────────────────────────────────
+function buildAttackerProfile(req, ip) {
+  const ua = req.headers['user-agent'] || 'Unknown';
+  let browser = 'Unknown Browser';
+  let os = 'Unknown OS';
+  let device = 'Unknown Device';
+
+  if (/Chrome\/\S+/.test(ua)) browser = 'Chrome ' + (ua.match(/Chrome\/([\d.]+)/)?.[1] || '');
+  else if (/Firefox\/\S+/.test(ua)) browser = 'Firefox ' + (ua.match(/Firefox\/([\d.]+)/)?.[1] || '');
+  else if (/Safari\//.test(ua) && !/Chrome\/\S+/.test(ua)) browser = 'Safari';
+  else if (/Edge\/\S+/.test(ua)) browser = 'Edge ' + (ua.match(/Edge\/([\d.]+)/)?.[1] || '');
+  else if (/MSIE|Trident/.test(ua)) browser = 'Internet Explorer';
+
+  if (/Windows NT 10/.test(ua)) os = 'Windows 10/11';
+  else if (/Windows NT 6\.3/.test(ua)) os = 'Windows 8.1';
+  else if (/Windows NT 6\.1/.test(ua)) os = 'Windows 7';
+  else if (/Mac OS X/.test(ua)) os = 'macOS ' + (ua.match(/Mac OS X ([\d_]+)/)?.[1]?.replace(/_/g, '.') || '');
+  else if (/Android/.test(ua)) os = 'Android ' + (ua.match(/Android ([\d.]+)/)?.[1] || '');
+  else if (/iPhone|iPad/.test(ua)) os = 'iOS ' + (ua.match(/OS ([\d_]+)/)?.[1]?.replace(/_/g, '.') || '');
+  else if (/Linux/.test(ua)) os = 'Linux';
+
+  device = (/Mobile|Android|iPhone|iPad/.test(ua)) ? 'Mobile/Tablet' : 'Desktop/Laptop';
+
+  const referrer = req.headers['referer'] || req.headers['referrer'] || 'Direct/Unknown';
+  const lang = req.headers['accept-language']?.split(',')[0] || 'Unknown';
+
+  return {
+    ip,
+    browser,
+    os,
+    device,
+    userAgent: ua.slice(0, 300),
+    referrer: referrer.slice(0, 200),
+    language: lang,
+    path: req.path,
+    method: req.method,
+    timestamp: new Date().toISOString(),
+    headers: {
+      host: req.headers['host'] || '',
+      acceptLanguage: req.headers['accept-language'] || '',
+      acceptEncoding: req.headers['accept-encoding'] || '',
+      connection: req.headers['connection'] || '',
+      dnt: req.headers['dnt'] || '',
+      secFetchSite: req.headers['sec-fetch-site'] || ''
+    }
+  };
+}
+
+// ── THREAT LEVEL ────────────────────────────────────────────────
+function getThreatLevel(count, path) {
+  const sensitiveRoutes = ['/api/auth', '/api/staff', '/api/audit', '/api/patients'];
+  const isSensitive = sensitiveRoutes.some(r => path.startsWith(r));
+
+  if (count >= 20) return { level: 'critical', label: 'SUSTAINED ATTACK', color: '#ef4444' };
+  if (count >= 10) return { level: 'high', label: 'REPEATED INTRUSION', color: '#f59e0b' };
+  if (count >= 5) return { level: 'high', label: 'MULTIPLE ATTEMPTS', color: '#f59e0b' };
+  if (isSensitive) return { level: 'high', label: 'SENSITIVE ROUTE PROBE', color: '#f59e0b' };
+  return { level: 'medium', label: 'UNAUTHORIZED ACCESS', color: '#38bdf8' };
+}
+
+// ── WIFI ACCESS CONTROL MIDDLEWARE ──────────────────────────────
+export const wifiAccessControl = async (req, res, next) => {
+  try {
+    // Allow health and network-status endpoints to bypass checks
+    if (req.path === '/api/health' || req.path === '/api/network-status') {
+      return next();
+    }
+
+    // Only enforce in production
+    if (process.env.NODE_ENV === 'production') {
+      const ip = getClientIP(req);
+      const clean = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+
+      if (!isAllowed(clean)) {
+        // Build attacker profile and update in-memory tracker
+        const profile = buildAttackerProfile(req, ip);
+        const now = Date.now();
+
+        const existing = attackTracker.get(ip) || {
+          count: 0,
+          firstSeen: now,
+          lastSeen: now,
+          paths: new Set(),
+          userAgents: new Set()
+        };
+
+        existing.count++;
+        existing.lastSeen = now;
+        existing.paths.add(req.path);
+        existing.userAgents.add(`${profile.browser}/${profile.os}`);
+        attackTracker.set(ip, existing);
+
+        const threat = getThreatLevel(existing.count, req.path);
+
+        // Persist audit and optionally send alerts
+        try {
+          await query(
+            `INSERT INTO audit_logs
+             (actor_id, actor_name, action, resource, method, status_code,
+              ip_address, user_agent, severity, details, timestamp)
+             VALUES ($1,$2,$3,$4,$5,403,$6,$7,$8,$9::jsonb,NOW())`,
+            [
+              'EXTERNAL_INTRUDER',
+              `${profile.device}.${profile.os}.${profile.browser}`,
+              `UNAUTHORIZED ACCESS_ATTEMPT (${existing.count} total from this IP)`,
+              req.path,
+              req.method,
+              ip,
+              profile.userAgent.slice(0, 200),
+              threat.level,
+              JSON.stringify({
+                ip,
+                browser: profile.browser,
+                os: profile.os,
+                device: profile.device,
+                language: profile.language,
+                referrer: profile.referrer,
+                attemptNumber: existing.count,
+                firstSeen: new Date(existing.firstSeen).toISOString(),
+                pathsProbed: [...existing.paths],
+                userAgents: [...existing.userAgents]
+              })
+            ]
+          );
+
+          // Send intrusion alert every 5 attempts (and on first)
+          if (existing.count === 1 || existing.count % 5 === 0) {
+            try {
+              await sendIntrusionAlert({
+                ip,
+                profile,
+                threat,
+                existing,
+                description: `Unauthorized access attempt from ${ip}`,
+                timestamp: new Date().toISOString()
+              });
+            } catch (emailErr) {
+              console.warn('[IDS] Email alert failed:', emailErr?.message || emailErr);
+            }
+          }
+        } catch (dbErr) {
+          console.error('[IDS] DB log failed:', dbErr?.message || dbErr);
+        }
+
+        // Respond with blocking message
+        return res.status(403).json({
+          error: 'Access denied - AIC Kapsowar HMS is only accessible from hospital WiFi networks.',
+          code: 'NOT_ON_HOSPITAL_WIFI',
+          message: 'Please connect to AIC-Staff-Secure, AIC-Clinical or AIC-Patients WiFi.',
+          allowedNetworks: ['AIC-Staff-Secure', 'AIC-Clinical', 'AIC-Patients'],
+          incident: `INC-${Date.now()}`,
+          warning: existing.count >= 5 ? 'REPEATED_ACCESS_ATTEMPTS_DETECTED - Your activity has been logged and reported.' : 'This access attempt has been logged.'
+        });
+      }
+    }
+
+    // allowed or not in production -> continue
+    return next();
+  } catch (err) {
+    // On unexpected error, log and allow request to continue (fail-open to avoid locking out legitimate traffic)
+    console.error('[wifiAccessControl] unexpected error:', err?.message || err);
+    return next();
+  }
+};
+
+// ── NETWORK STATUS ENDPOINT ─────────────────────────────────────
+export const getNetworkStatus = (req, res) => {
+  const ip = getClientIP(req);
+  const clean = ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+
+  res.json({
+    clientIP: clean,
+    isAllowed: isAllowed(clean),
+    hospitalNetworks: [
+      { ssid: 'AIC-Staff-Secure', subnet: '192.168.1.0/24', roles: ['staff', 'admin', 'doctor', 'nurse', 'receptionist'] },
+      { ssid: 'AIC-Clinical', subnet: '192.168.1.0/24', roles: ['doctor', 'nurse', 'lab_tech'] },
+      { ssid: 'AIC-Patients', subnet: '192.168.1.0/24', roles: ['patient'] }
+    ],
+    timestamp: new Date().toISOString()
+  });
+};
+
+// ── ATTACK REPORT (for admin dashboard) ──────────────────────────
+export const getAttackReport = (req, res) => {
+  const entries = [];
+  for (const [ip, data] of attackTracker.entries()) {
+    entries.push({
+      ip,
+      attempts: data.count,
+      firstSeen: new Date(data.firstSeen).toISOString(),
+      lastSeen: new Date(data.lastSeen).toISOString(),
+      pathsProbed: [...data.paths],
+      devices: [...data.userAgents],
+      threat: getThreatLevel(data.count, [...data.paths][0] || '/').level
+    });
+  }
+
+  entries.sort((a, b) => b.attempts - a.attempts);
+
+  res.json({
+    totalUniqueIPs: entries.length,
+    totalAttempts: entries.reduce((s, e) => s + e.attempts, 0),
+    criticalThreats: entries.filter(e => e.threat === 'critical').length,
+    attackers: entries,
+    since: new Date(
+      Math.min(...entries.map(e => new Date(e.firstSeen).getTime()), Date.now())
+    ).toISOString()
+  });
+};
