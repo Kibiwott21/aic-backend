@@ -1,4 +1,8 @@
+<<<<<<< HEAD
 import bcrypt from 'bcrypt';
+=======
+import bcrypt from 'bcryptjs';
+>>>>>>> 82282e34a8288fccb7ed8f89834e7fa77ec9eba8
 import { v4 as uuidv4 } from 'uuid';
 import { query } from '../config/database.js';
 import { generateToken, generatePatientToken } from '../middleware/auth.js';

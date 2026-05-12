@@ -479,7 +479,11 @@ router.put('/staff/:id', authMiddleware, rbacMiddleware('admin'), async (req,res
 
 router.put('/staff/:id/reset-password', authMiddleware, rbacMiddleware('admin'), async (req,res) => {
   try {
+<<<<<<< HEAD
     const bcrypt = (await import('bcrypt')).default;
+=======
+    const bcrypt = (await import('bcryptjs')).default;
+>>>>>>> 82282e34a8288fccb7ed8f89834e7fa77ec9eba8
     const { newPassword } = req.body;
     if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Min 8 characters' });
     const hash = await bcrypt.hash(newPassword, 10);
@@ -955,7 +959,11 @@ router.put('/admin/change-password', authMiddleware, rbacMiddleware('admin'), as
     const { currentPassword, newPassword } = req.body;
     if (!currentPassword||!newPassword) return res.status(400).json({error:'Both fields required'});
     if (newPassword.length < 8) return res.status(400).json({error:'Min 8 characters'});
+<<<<<<< HEAD
     const bcrypt = (await import('bcrypt')).default;
+=======
+    const bcrypt = (await import('bcryptjs')).default;
+>>>>>>> 82282e34a8288fccb7ed8f89834e7fa77ec9eba8
     const st = await query('SELECT password_hash FROM staff WHERE id=$1',[req.user.id]);
     const valid = await bcrypt.compare(currentPassword, st.rows[0].password_hash);
     if (!valid) return res.status(401).json({error:'Current password is incorrect'});
